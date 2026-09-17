@@ -158,7 +158,24 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 2,  32, 128, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32, 128, 128, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 256, 2,  64, 128, 128,  64, 1, true);
+    // [R9700/F15] head-256 gqa32: cut per-block LDS from ~35.3 KiB to ~19-21.5 KiB so 2 blocks/CU
+    // (16 of 32 wave slots) fit in the 64 KiB LDS instead of 1 block (8 wave slots).
+    // LDS/block = max(combine, Q, KV+mask) with (HIP: no smem swizzle, stride = nbatch + 4):
+    //   combine = nthreads/32*16*(nbatch_combine+4)*4   34816 B @64 -> 18432 B @32
+    //   Q       = ncols*(DKQ/2+4)*4                     16896 B (fixed)
+    //   KV+mask = nbatch_fa*(nbatch_K2+4)*4 + ncols1*(nbatch_fa/2+4)*4
+    //             33792+2304 B @128 -> 17408+<=4608 B @64
+    // => max(18432, 16896, <=22016) = <=22016 B; 2 blocks = <=44032 B <= 65536 B.
+    // nbatch_fa must stay 64: the kernel requires nbatch_fa % (np*T_C_KQ::J) == 0 with a non-empty
+    // KQ_C[], and np = nwarps*cols_per_warp/ncols = 8*16/32 = 4, i.e. nbatch_fa >= 64 (the earlier
+    // nbatch_fa=32 attempt broke the build: zero-length KQ_C/B arrays + "bad loop size" asserts).
+    // nbatch_K2/V2 128->64 only changes the K/V load chunking (2x64 instead of 1x128; same accumulation
+    // order as the existing (192,128) rows), nbatch_combine 64->32 is a proven value ((64,64) rows,
+    // multi-iteration combine already instantiated by the (512,512) rows). Numerics: unchanged granularity.
+    // gqa64 row kept at upstream values: its Q tile alone is 64*132*4 = 33792 B > 32768 B, so 2
+    // blocks/CU is impossible there no matter how small the KV/combine tiles are.
+    // Bench-gated: A/B on gfx1201 (Qwen3.8-27B head-256); revert this row if the occupancy win is not realized.
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 256, 2,  64,  64,  64,  32, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 2,  64, 128, 128,  64, 1, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 160, 128, 128, 1, true);
@@ -2001,6 +2018,15 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     const size_t nbytes_shared_total = std::max(nbytes_shared_combine, Q_in_reg ?
         std::max(nbytes_shared_Q,  nbytes_shared_KV + nbytes_shared_mask) :
                  nbytes_shared_Q + nbytes_shared_KV + nbytes_shared_mask);
+
+    // [R9700/F9] The fattn-mma host LDS math above is not otherwise validated against the device's
+    // per-block shared-memory limit before launch: on HIP, CUDA_SET_SHARED_MEMORY_LIMIT is a no-op, so
+    // an over-large config row would only surface as a cryptic kernel-launch failure deep in inference.
+    // The kernel uses only dynamic (extern __shared__) memory, so nbytes_shared_total IS the full
+    // per-block LDS. Make the 64 KiB guarantee explicit: on gfx1201 (smpbo == 64 KiB) a violation is a
+    // config-table bug. This can only fire for a config that would fail to launch anyway (total >=
+    // dynamic > smpbo), so it never changes behavior for a working config.
+    GGML_ASSERT(nbytes_shared_total <= ggml_cuda_info().devices[id].smpbo);
 
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));

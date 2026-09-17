@@ -468,25 +468,52 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         // nwarps=8 benefits types with simple vec_dot on RDNA4 (ncols_dst=1).
         // Types with complex vec_dot (Q3_K, IQ2_*, IQ3_*) regress due to register
         // pressure and lookup table contention at higher thread counts.
-        if (ncols_dst == 1) {
-            switch (type) {
-                case GGML_TYPE_Q4_0:
-                case GGML_TYPE_Q4_1:
-                case GGML_TYPE_Q5_0:
-                case GGML_TYPE_Q5_1:
-                case GGML_TYPE_Q8_0:
-                case GGML_TYPE_Q2_K:
-                case GGML_TYPE_Q4_K:
-                case GGML_TYPE_Q5_K:
-                case GGML_TYPE_Q6_K:
-                case GGML_TYPE_IQ4_NL:
-                case GGML_TYPE_IQ4_XS:
-                    return 8;
-                default:
-                    return 1;
-            }
+        bool simple_vec_dot = false;
+        switch (type) {
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_0:
+            case GGML_TYPE_Q5_1:
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+            case GGML_TYPE_Q6_K:
+            case GGML_TYPE_IQ4_NL:
+            case GGML_TYPE_IQ4_XS:
+                simple_vec_dot = true;
+                break;
+            default:
+                simple_vec_dot = false;
+                break;
         }
-        return 1;
+        if (!simple_vec_dot) {
+            return 1;
+        }
+        // [R9700/F3] For the same simple-vec_dot whitelist, also use nwarps>1 at decode
+        // batch 2-8 (ncols_dst 2-8). The prior default of nwarps=1 for batch>1 left
+        // small/skinny projection weights (N=96..256) with very few blocks (rpb=1 on
+        // RDNA4) -> only a small fraction of the 32 wave slots/CU busy (the same idle-CU
+        // root as radiance's skinny GEMM). Scaling 8 (batch 1) -> 4 (batch 2-4) -> 2
+        // (batch 5-8) mirrors the GENERIC table's 4->2 banding, scaled 2x for RDNA4's
+        // simple types; stays <=8 warps (<=256 thr). Batch-1 behavior is unchanged.
+        // Bench-gated on gfx1201: A/B tg128 batch 8; if a whitelisted type regresses,
+        // drop it from the switch above. (Fold into upstream #20831/#24386 when merging.)
+        switch (ncols_dst) {
+            case 1:
+                return 8;
+            case 2:
+            case 3:
+            case 4:
+                return 4;
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+                return 2;
+            default:
+                return 1;
+        }
     }
     if (table_id == MMVQ_PARAMETERS_RDNA3_0) {
         // RDNA3 (W7900): stricter whitelist than RDNA4.

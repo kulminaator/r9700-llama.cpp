@@ -665,8 +665,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
+    // [R9700/F15] head-256 arm uses the same batch threshold as the MFMA branch below (> 64) instead of
+    // > 16. The low > 16 threshold routed head-256 spec-decode verify batches (intermediate ne1 widths)
+    // onto the WMMA kernel where it is ~20% slower on gfx1201 (measured 51.70->41.37 t/s, Qwen3.8-27B
+    // gqa6 head-256; upstream issue #28867, bisected to #28102). Raising it to > 64 recovers the loss
+    // with 0% prefill cost and matches the CDNA (MFMA) dispatch policy.
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
-            Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
+            Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 64)) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
